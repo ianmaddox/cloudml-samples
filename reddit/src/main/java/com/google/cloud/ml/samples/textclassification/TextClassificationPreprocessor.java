@@ -11,12 +11,30 @@ import com.google.cloud.bigquery.Table;
 import com.google.cloud.bigquery.TableId;
 import com.google.cloud.bigquery.TableInfo;
 import com.google.cloud.bigquery.ViewDefinition;
+
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeoutException;
+
+import org.apache.hadoop.io.BytesWritable;
 import org.apache.spark.SparkConf;
-import org.apache.spark.sql.Dataset;
-import org.apache.spark.sql.Row;
-import org.apache.spark.sql.SparkSession;
+import org.apache.spark.SparkContext;
+import org.apache.spark.api.java.function.MapFunction;
+import org.apache.spark.ml.feature.StringIndexer;
+import org.apache.spark.ml.feature.Tokenizer;
+import org.apache.spark.sql.*;
+import org.apache.spark.sql.api.java.UDF1;
+import org.apache.spark.sql.types.DataTypes;
+import org.tensorflow.example.Example;
+import org.tensorflow.example.Feature;
+import org.tensorflow.example.Features;
+import org.tensorflow.example.Int64List;
+import scala.Function1;
+import scala.Tuple2;
+import scala.collection.JavaConversions;
+import scala.collection.Seq;
 
 /**
  * Created by elibixby on 2/1/17.
@@ -32,6 +50,16 @@ public class TextClassificationPreprocessor {
 
   static String TEMP_DATASET = "temp_preprocessor";
   static String TEMP_TABLE = "temp_table";
+
+  static class AssembleUDF implements UDF1<List<Map.Entry<Integer, Integer>>, List<Integer>>{
+
+    public List<Integer> call(List<Map.Entry<Integer, Integer>> entries) throws Exception {
+      ArrayList<Integer> wordIds = new ArrayList<Integer>(entries.size());
+      for (Map.Entry<Integer, Integer> entry: entries){
+        wordIds.add(entry.getKey(), entry.getValue());
+      }
+      return wordIds;      }
+  }
 
 
   static void exportTable(String filePattern, int numClasses, String projectId)
@@ -62,9 +90,15 @@ public class TextClassificationPreprocessor {
     extractJob.waitFor();
   }
 
+  static void saveIndexerAsTSVFile(SparkContext sc, StringIndexer indexer){
+
+    sc.parallelize(
+
+    )
+  }
+
 
   public static void main(String[] args) throws TimeoutException, InterruptedException {
-    String basePath = args[0];
     int numClasses = Integer.parseInt(args[1]);
     SparkSession sp = SparkSession.builder().appName("TFTextClassifier").getOrCreate();
     SparkConf sc = sp.sparkContext().conf();
@@ -73,9 +107,62 @@ public class TextClassificationPreprocessor {
 
     exportTable(filePattern, numClasses, projectId);
     
-    Dataset<Row> df = sp.read().format("com.databricks.spark.avro")
-        .load(filePattern)
+    Dataset<Row> df = sp.read().format("com.databricks.spark.avro").load(filePattern);
 
+    Tokenizer tokenizer = new Tokenizer().setInputCol("title").setOutputCol("words");
+    StringIndexer wordIndexer = new StringIndexer().setInputCol("word").setOutputCol("wordId");
+
+    Dataset<Row> tokenized = tokenizer.transform(df).na().drop();
+
+    Dataset<Row> positions = tokenized.select(
+            tokenized.col("id"),
+            tokenized.col("subreddit"),
+            functions.posexplode(tokenized.col("words")).as(new String[]{"pos", "word"})
+    );
+
+    Dataset<Row> indexed = wordIndexer.fit(positions).transform(positions);
+
+
+
+    sp.sqlContext().udf().register(
+            "assemble",
+            new AssembleUDF(),
+            DataTypes.createArrayType(DataTypes.IntegerType)
+    );
+
+    Dataset<Row> gathered = indexed.select(
+            indexed.col("id"),
+            indexed.col("subreddit"),
+            functions.map(
+                    indexed.col("pos"),
+                    indexed.col("wordId")
+            ).as("indexed")
+    ).groupBy(indexed.col("id")).agg(
+            functions.collect_list("indexed").as("indices")
+    );
+
+    Dataset<Row> squashed = gathered.select(
+            gathered.col("subreddit"),
+            functions.callUDF("assemble", gathered.col("indices")).as("wordIds")
+    );
+
+    StringIndexer subredditIndexer = new StringIndexer().setInputCol("subreddit")
+            .setOutputCol("subredditId");
+
+    subredditIndexer.fit(squashed).transform(squashed);
+
+    squashed.map(new MapFunction<Row, byte[]>() {
+      public byte[] call(Row row) throws Exception {
+        Int64List.Builder words = Int64List.newBuilder().addAllValue(
+                (List<Long>)(List<?>)row.getList(row.fieldIndex("wordIds"))
+        );
+        Int64List.Builder subreddit = Int64List.newBuilder().addValue(row.getLong(row.fieldIndex("subredditId")));
+        Features.Builder features = Features.newBuilder()
+                .putFeature("words", Feature.newBuilder().setInt64List(words).build())
+                .putFeature("subreddit", Feature.newBuilder().setInt64List(subreddit).build());
+        return Example.newBuilder().setFeatures(features).build().toByteArray();
+      }
+    }, Encoders.BINARY()).write().format("org.tensorflow.hadoop.io.TFRecordFileOutputFormat").save(args[0]);
   }
 
 }
